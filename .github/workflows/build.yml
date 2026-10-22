@@ -1,0 +1,86 @@
+name: Build OBS plugin (GazCast Clean Record)
+
+# Builds the free, GPL-2.0-or-later GazCast Clean Record plugin for Windows x64.
+# Uses the obs-plugintemplate build scripts in .github/scripts.
+
+on:
+  workflow_dispatch:
+  push:
+
+# each build is also saved as a GitHub release people can download
+permissions:
+  contents: write
+
+concurrency:
+  group: build-clean-record-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUILD_CONFIG: RelWithDebInfo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read build spec
+        id: setup
+        run: |
+          $BuildSpec = Get-Content -Path buildspec.json -Raw | ConvertFrom-Json
+          "pluginName=$($BuildSpec.name)" >> $env:GITHUB_OUTPUT
+          "pluginVersion=$($BuildSpec.version)" >> $env:GITHUB_OUTPUT
+
+      # obs-deps, Qt6 and the libobs/obs-frontend-api build from the OBS sources
+      # (all pinned by buildspec.json) land in .deps; cache them.
+      - name: Cache OBS dependencies
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: obs-deps-windows-x64-${{ hashFiles('buildspec.json', 'cmake/common/buildspec_common.cmake', 'cmake/windows/buildspec.cmake') }}
+
+      - name: Build plugin
+        run: .github/scripts/Build-Windows.ps1 -Target x64 -Configuration $env:BUILD_CONFIG
+
+      # The template's packaging step: zips release/<config> into
+      # release/<name>-<version>-windows-x64.zip (the template no longer
+      # builds a Windows installer).
+      - name: Package plugin
+        run: .github/scripts/Package-Windows.ps1 -Target x64 -Configuration $env:BUILD_CONFIG
+
+      - name: Check output layout
+        run: |
+          $Name = '${{ steps.setup.outputs.pluginName }}'
+          $Root = "release/$env:BUILD_CONFIG/$Name"
+          foreach ($Path in @("$Root/bin/64bit/$Name.dll", "$Root/data/locale/en-US.ini")) {
+            if (-not (Test-Path $Path)) { throw "Missing $Path" }
+          }
+          Get-ChildItem -Recurse "release/$env:BUILD_CONFIG" | Select-Object FullName, Length | Format-Table -AutoSize
+
+      # Artifact contents (GitHub zips it on download):
+      #   RelWithDebInfo/gazcast-clean-record/bin/64bit/gazcast-clean-record.dll (+ .pdb)
+      #   RelWithDebInfo/gazcast-clean-record/data/...
+      #   gazcast-clean-record-<version>-windows-x64.zip (the same gazcast-clean-record/ folder, ready to hand out)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true # the release below has it if Actions storage is full
+        with:
+          name: gazcast-clean-record-windows
+          path: |
+            release/${{ env.BUILD_CONFIG }}/
+            release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save the plugin as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gazcast-clean-record-${{ github.run_number }}
+          name: GazCast Clean Record build ${{ github.run_number }} 
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          files: release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64.zip
