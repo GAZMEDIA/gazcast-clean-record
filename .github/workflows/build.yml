@@ -77,6 +77,9 @@ jobs:
           & $Iscc "/DVersion=$Version" "/DSourceDir=$Source" "/DOutputDir=$Out" .github/installer/$Name.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           if (-not (Test-Path "release/$Name-$Version-windows-x64-setup.exe")) { throw "Installer not found" }
+          # Same file without the version, so websites can link to
+          # releases/latest/download/gazcast-clean-record-windows-x64-setup.exe
+          Copy-Item "release/$Name-$Version-windows-x64-setup.exe" "release/$Name-windows-x64-setup.exe"
 
       # Artifact contents (GitHub zips it on download):
       #   RelWithDebInfo/gazcast-clean-record/bin/64bit/gazcast-clean-record.dll (+ .pdb)
@@ -97,9 +100,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: gazcast-clean-record-${{ github.run_number }}
-          name: GazCast Clean Record build ${{ github.run_number }} 
+          name: GazCast Clean Record ${{ steps.setup.outputs.pluginVersion }} (build ${{ github.run_number }})
           target_commitish: ${{ github.sha }}
-          prerelease: true
+          # Builds from main are the public download ("latest"); other branches are test builds.
+          prerelease: ${{ github.ref != 'refs/heads/main' }}
+          make_latest: ${{ github.ref == 'refs/heads/main' }}
           files: |
             release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-setup.exe
+            release/${{ steps.setup.outputs.pluginName }}-windows-x64-setup.exe
             release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64.zip

@@ -12,8 +12,10 @@ the template's macOS and Linux build paths are kept and should also work.
 
 ## Install (Windows)
 
-1. Download `gazcast-clean-record-<version>-windows-x64-setup.exe` from this
-   repo's [Releases](https://github.com/GAZMEDIA/gazcast-clean-record/releases).
+1. Download the installer:
+   https://github.com/GAZMEDIA/gazcast-clean-record/releases/latest/download/gazcast-clean-record-windows-x64-setup.exe
+   (always the newest version; older ones are on the
+   [Releases](https://github.com/GAZMEDIA/gazcast-clean-record/releases) page).
 2. Close OBS and run the setup file. If Windows shows "Windows protected your
    PC", click **More info**, then **Run anyway** (the installer is not signed).
 3. Start OBS and turn the dock on from **Docks → GazCast Clean Record**.
