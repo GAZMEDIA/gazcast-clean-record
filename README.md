@@ -26,11 +26,11 @@ Studio), or delete `C:\ProgramData\obs-studio\plugins\gazcast-clean-record`.
 
 ## Use
 
-1. In the **GazCast Clean Record** dock, check the list of sources. Every
-   overlay is ticked for you the first time the plugin sees it: browser
-   sources (GazCast and any other web overlay), images, slideshows and text.
-   Cameras, screen and window captures, media files and colour backgrounds stay
-   in. Untick anything you want to keep, tick anything else to leave out.
+1. The **GazCast Clean Record** dock lists every source in OBS, all ticked.
+   Untick the ones to leave out of the clean recording (your overlays,
+   logos, text...). Sources that look like overlays (browser sources,
+   GazCast and other web overlays, images, slideshows, text) are labelled
+   "(overlay)" to help you choose, but nothing is unticked for you.
 2. Press **Start Recording** in OBS as usual. With **Start and stop together
    with OBS's Start Recording button** ticked (the default), the clean copy
    starts and stops with it and is saved next to your recording as

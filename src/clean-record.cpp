@@ -20,12 +20,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * Clean recording.
  *
  * How it works:
- * - Sources to leave out carry the "Hide in GazCast clean recording" filter
- *   (gazcast_clean_hide). Overlay-type sources (browser, image, slideshow,
- *   text, and GazCast's own) get it automatically the first time they are
- *   seen; any source can be ticked or unticked in the dock's list or its
- *   Filters window. The
- *   filter is saved with the scene collection like any other filter.
+ * - The dock lists every video source, ticked = in the clean recording. An
+ *   unticked source carries the "Hide in GazCast clean recording" filter
+ *   (gazcast_clean_hide), which can also be added in its Filters window and is
+ *   saved with the scene collection. Overlay-type sources (browser, image,
+ *   slideshow, text, GazCast's own) are only labelled, never unticked for the
+ *   user.
  * - While a clean recording runs, a private source (gazcast_clean_mix) renders
  *   OBS's program output (output channel 0, i.e. the transition) into its own
  *   view/video mix. During that render a flag is set, and the filter draws
@@ -81,9 +81,6 @@ namespace {
 constexpr const char *kMixSourceId = "gazcast_clean_mix";
 constexpr const char *kHideFilterId = "gazcast_clean_hide";
 constexpr const char *kDockId = "gazcast-clean";
-/* Private setting on a source: GazCast already tagged it once, so a user who
- * removes the filter on purpose does not get it back. */
-constexpr const char *kAutoTagged = "gazcast_clean_tagged";
 constexpr const char *kConfigFile = "clean-record.json";
 
 /* > 0 while the clean mix renders. Rendering only happens on OBS's graphics
@@ -248,12 +245,11 @@ struct SourceRow {
 	}
 };
 
-/* Every input with video, overlays first. Also gives each overlay the filter
- * the first time it is seen; after that the user's tick decides. */
+/* Every input with video, overlays first. Nothing is ticked or hidden
+ * automatically; the user chooses. */
 std::vector<SourceRow> ScanSources()
 {
-	/* Collect first: adding a filter creates a source, which must not happen
-	 * inside obs_enum_sources. */
+	/* Collect first, then read each source outside obs_enum_sources. */
 	std::vector<OBSSource> sources;
 	obs_enum_sources(
 		[](void *param, obs_source_t *source) {
@@ -268,15 +264,6 @@ std::vector<SourceRow> ScanSources()
 	for (obs_source_t *source : sources) {
 		const bool gazcast = IsGazCastOverlay(source);
 		const bool overlay = gazcast || IsOverlay(source);
-		if (overlay) {
-			OBSDataAutoRelease priv = obs_source_get_private_settings(source);
-			if (!obs_data_get_bool(priv, kAutoTagged)) {
-				SetHidden(source, true);
-				obs_data_set_bool(priv, kAutoTagged, true);
-				obs_log(LOG_INFO, "clean record: leaving overlay '%s' out",
-					obs_source_get_name(source));
-			}
-		}
 
 		const char *name = obs_source_get_name(source);
 		rows.push_back({name ? name : "", gazcast, overlay, HasHideFilter(source)});
@@ -665,7 +652,7 @@ void RefreshList()
 		auto *item = new QListWidgetItem(label, g_ui.list);
 		item->setData(Qt::UserRole, QString::fromStdString(row.name));
 		item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-		item->setCheckState(row.hidden ? Qt::Checked : Qt::Unchecked);
+		item->setCheckState(row.hidden ? Qt::Unchecked : Qt::Checked);
 	}
 	if (g_ui.list->verticalScrollBar()) {
 		g_ui.list->verticalScrollBar()->setValue(scroll);
@@ -677,7 +664,7 @@ void OnItemChanged(QListWidgetItem *item)
 	const std::string name = item->data(Qt::UserRole).toString().toStdString();
 	OBSSourceAutoRelease source = obs_get_source_by_name(name.c_str());
 	if (source) {
-		SetHidden(source, item->checkState() == Qt::Checked);
+		SetHidden(source, item->checkState() != Qt::Checked);
 	}
 	RefreshList();
 }
