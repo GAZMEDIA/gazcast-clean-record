@@ -161,7 +161,17 @@ bool IsGazCastOverlay(obs_source_t *source)
 		return true;
 	}
 
-	if (strcmp(obs_source_get_unversioned_id(source), "browser_source") != 0) {
+	const char *id = obs_source_get_unversioned_id(source);
+	OBSDataAutoRelease settings = obs_source_get_settings(source);
+
+	/* GazCast's NDI output, received with the DistroAV (obs-ndi) plugin. NDI
+	 * names look like "PC-NAME (GazCast)" or "PC-NAME (GazCast - Lower third)". */
+	if (strcmp(id, "ndi_source") == 0) {
+		const QString ndiName = QString::fromUtf8(obs_data_get_string(settings, "ndi_source_name"));
+		return ndiName.contains(QLatin1String("(GazCast"), Qt::CaseInsensitive);
+	}
+
+	if (strcmp(id, "browser_source") != 0) {
 		return false;
 	}
 
@@ -169,7 +179,6 @@ bool IsGazCastOverlay(obs_source_t *source)
 	 * serves them from overlays.gazgoc.com.ng. */
 	static const QRegularExpression localOverlay(QStringLiteral(R"(^https?://(127\.0\.0\.1|localhost)(:\d+)?/o/)"),
 						     QRegularExpression::CaseInsensitiveOption);
-	OBSDataAutoRelease settings = obs_source_get_settings(source);
 	const QString url = QString::fromUtf8(obs_data_get_string(settings, "url"));
 	return url.contains(localOverlay) || url.contains(QLatin1String("gazgoc.com.ng"), Qt::CaseInsensitive);
 }
