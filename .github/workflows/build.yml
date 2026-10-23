@@ -64,6 +64,20 @@ jobs:
           if ($Dll.Length -lt 40000) { throw "$Name.dll is only $($Dll.Length) bytes: the plugin code was not compiled in" }
           Get-ChildItem -Recurse "release/$env:BUILD_CONFIG" | Select-Object FullName, Length | Format-Table -AutoSize
 
+      # A setup .exe that copies the plugin into OBS's plugin folder. Inno Setup 6
+      # is preinstalled on GitHub's Windows runners.
+      - name: Build installer
+        run: |
+          $Name = '${{ steps.setup.outputs.pluginName }}'
+          $Version = '${{ steps.setup.outputs.pluginVersion }}'
+          $Iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $Iscc)) { choco install innosetup -y --no-progress; $Iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          $Source = (Resolve-Path "release/$env:BUILD_CONFIG/$Name").Path
+          $Out = (Resolve-Path "release").Path
+          & $Iscc "/DVersion=$Version" "/DSourceDir=$Source" "/DOutputDir=$Out" .github/installer/$Name.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          if (-not (Test-Path "release/$Name-$Version-windows-x64-setup.exe")) { throw "Installer not found" }
+
       # Artifact contents (GitHub zips it on download):
       #   RelWithDebInfo/gazcast-clean-record/bin/64bit/gazcast-clean-record.dll (+ .pdb)
       #   RelWithDebInfo/gazcast-clean-record/data/...
@@ -86,4 +100,6 @@ jobs:
           name: GazCast Clean Record build ${{ github.run_number }} 
           target_commitish: ${{ github.sha }}
           prerelease: true
-          files: release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64.zip
+          files: |
+            release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-setup.exe
+            release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64.zip
