@@ -12,14 +12,17 @@ the template's macOS and Linux build paths are kept and should also work.
 
 ## Install (Windows)
 
-1. Download the zip from this repo's
-   [Releases](https://github.com/GAZMEDIA/gazcast-clean-record/releases).
-2. Close OBS.
-3. Unzip it and copy the `gazcast-clean-record` folder to
-   `C:\ProgramData\obs-studio\plugins\`.
-4. Start OBS and turn the dock on from **Docks → GazCast Clean Record**.
+1. Download `gazcast-clean-record-<version>-windows-x64-setup.exe` from this
+   repo's [Releases](https://github.com/GAZMEDIA/gazcast-clean-record/releases).
+2. Close OBS and run the setup file. If Windows shows "Windows protected your
+   PC", click **More info**, then **Run anyway** (the installer is not signed).
+3. Start OBS and turn the dock on from **Docks → GazCast Clean Record**.
 
-To uninstall, delete `C:\ProgramData\obs-studio\plugins\gazcast-clean-record`.
+Prefer no installer? Download the `.zip` instead, unzip it and copy the
+`gazcast-clean-record` folder to `C:\ProgramData\obs-studio\plugins\`.
+
+To uninstall, use **Settings → Apps** in Windows (GazCast Clean Record for OBS
+Studio), or delete `C:\ProgramData\obs-studio\plugins\gazcast-clean-record`.
 
 ## Use
 
