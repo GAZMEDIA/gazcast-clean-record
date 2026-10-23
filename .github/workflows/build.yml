@@ -59,6 +59,9 @@ jobs:
           foreach ($Path in @("$Root/bin/64bit/$Name.dll", "$Root/data/locale/en-US.ini")) {
             if (-not (Test-Path $Path)) { throw "Missing $Path" }
           }
+          # An empty plugin (no sources compiled) is only ~11 KB; the real one is far bigger.
+          $Dll = Get-Item "$Root/bin/64bit/$Name.dll"
+          if ($Dll.Length -lt 40000) { throw "$Name.dll is only $($Dll.Length) bytes: the plugin code was not compiled in" }
           Get-ChildItem -Recurse "release/$env:BUILD_CONFIG" | Select-Object FullName, Length | Format-Table -AutoSize
 
       # Artifact contents (GitHub zips it on download):

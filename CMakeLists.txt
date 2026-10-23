@@ -39,6 +39,7 @@ if(ENABLE_QT)
   )
 endif()
 
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp src/clean-record.cpp src/clean-record.hpp)
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
