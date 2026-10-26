@@ -42,9 +42,8 @@ Studio), or delete `C:\ProgramData\obs-studio\plugins\gazcast-clean-record`.
    is called `GazCast clean <date> <time>` and goes in your recording folder.
 
 Unticking a scene or source adds a filter called **Hide in GazCast clean
-recording** to
-it, so you can also add or remove it from the source's **Filters** window. It
-is saved with your scene collection.
+recording** to it, so you can also add or remove it from its **Filters**
+window. It is saved with your scene collection.
 
 The clean copy uses the same video encoder and settings as your normal
 recording (or the first hardware encoder it finds, then x264), so it costs
