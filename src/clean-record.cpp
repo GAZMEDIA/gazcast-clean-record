@@ -20,32 +20,33 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * Clean recording.
  *
  * How it works:
- * - The dock lists every video source, ticked = in the clean recording. An
- *   unticked source carries the "Hide in GazCast clean recording" filter
+ * - The dock lists every scene and video source, ticked = in the clean
+ *   recording. An unticked scene or source carries the "Hide in GazCast clean recording" filter
  *   (gazcast_clean_hide), which can also be added in its Filters window and is
  *   saved with the scene collection. Overlay-type sources (browser, image,
  *   slideshow, text, GazCast's own) are only labelled, never unticked for the
  *   user.
  * - While a clean recording runs, a private source (gazcast_clean_mix) renders
- *   OBS's program output (output channel 0, i.e. the transition) into its own
- *   view/video mix. During that render a flag is set, and the filter draws
- *   nothing. Everywhere else (stream, normal recording, preview, projectors)
+ *   OBS's program scene into its own view/video mix, walking its items (and
+ *   nested scenes) itself so no texture from the main output is reused.
+ *   During that render a flag is set, and the filter draws nothing. Everywhere else (stream, normal recording, preview, projectors)
  *   the filter passes the source through untouched.
  * - The mix gets its own encoders (copies of the normal recording's encoder
  *   settings when available) and an ffmpeg_muxer output, with the same audio
  *   as the normal recording (its first track).
  *
- * Known limit: OBS renders some things once per frame and reuses them (a
- * scene item with crop, a scale filter or a blending mode set; a transition
- * while it is running). The main output renders first, so an overlay inside
- * such an item, and any overlay during a transition, still shows in the clean
- * copy. The stream is never affected.
+ * Known limit: while a transition runs (and when an item uses "crop to
+ * bounds"), the clean mix falls back to OBS's own drawing, which reuses the
+ * main output's textures, so overlays can show for that second. The stream is
+ * never affected.
  */
 
 #include "clean-record.hpp"
 
 #include <obs-module.h>
 #include <obs.hpp>
+#include <graphics/matrix4.h>
+#include <graphics/vec2.h>
 #include <util/config-file.h>
 #include <util/dstr.h>
 #include <util/platform.h>
@@ -71,10 +72,22 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QWidget>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <iterator>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace {
 
@@ -95,12 +108,355 @@ const char *MixGetName(void *)
 	return "GazCast clean mix";
 }
 
-void *MixCreate(obs_data_t *, obs_source_t *source)
+/* Scenes draw nested scenes, and cropped, scaled or blended items, into a
+ * texture once per frame. The main output draws first, so the clean mix would
+ * get those textures with the overlays still in them. Instead the clean mix
+ * walks the program scene itself and draws every item into textures of its
+ * own, the same way OBS does. During a transition, or if an item uses "crop to
+ * bounds", it falls back to OBS's own drawing. */
+struct MixData {
+	obs_source_t *source = nullptr;
+	gs_samplerstate_t *pointSampler = nullptr;
+	std::unordered_map<obs_sceneitem_t *, gs_texrender_t *> textures;
+	std::unordered_set<obs_sceneitem_t *> used;
+};
+
+struct BlendParams {
+	gs_blend_type srcColor;
+	gs_blend_type srcAlpha;
+	gs_blend_type dstColor;
+	gs_blend_type dstAlpha;
+	gs_blend_op_type op;
+};
+
+/* Same order as enum obs_blending_type, values copied from obs-scene.c. */
+const BlendParams kBlendParams[] = {
+	{GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_OP_ADD},           // normal
+	{GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_OP_ADD},                           // additive
+	{GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_OP_REVERSE_SUBTRACT},              // subtract
+	{GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_INVSRCCOLOR, GS_BLEND_INVSRCALPHA, GS_BLEND_OP_ADD},           // screen
+	{GS_BLEND_DSTCOLOR, GS_BLEND_DSTALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_OP_ADD}, // multiply
+	{GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_OP_MAX},                           // lighten
+	{GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_ONE, GS_BLEND_OP_MIN},                           // darken
+};
+
+/* obs_sceneitem_get_bounds_crop only exists in OBS 31 and later. */
+using BoundsCropFn = bool (*)(const obs_sceneitem_t *);
+
+BoundsCropFn GetBoundsCropFn()
 {
-	return source;
+	static BoundsCropFn fn = [] {
+#ifdef _WIN32
+		HMODULE obs = GetModuleHandleW(L"obs.dll");
+		return obs ? reinterpret_cast<BoundsCropFn>(GetProcAddress(obs, "obs_sceneitem_get_bounds_crop"))
+			   : nullptr;
+#else
+		return reinterpret_cast<BoundsCropFn>(dlsym(RTLD_DEFAULT, "obs_sceneitem_get_bounds_crop"));
+#endif
+	}();
+	return fn;
 }
 
-void MixDestroy(void *) {}
+/* 0: no other filters, 1: other filters, 2: hidden from the clean recording */
+int CleanFilterState(obs_source_t *source)
+{
+	int state = 0;
+	obs_source_enum_filters(
+		source,
+		[](obs_source_t *, obs_source_t *filter, void *param) {
+			int *out = static_cast<int *>(param);
+			if (!obs_source_enabled(filter)) {
+				return;
+			}
+			if (strcmp(obs_source_get_unversioned_id(filter), kHideFilterId) == 0) {
+				*out = 2;
+			} else if (*out == 0) {
+				*out = 1;
+			}
+		},
+		&state);
+	return state;
+}
+
+std::vector<obs_sceneitem_t *> SceneItems(obs_scene_t *scene)
+{
+	std::vector<obs_sceneitem_t *> items;
+	obs_scene_enum_items(
+		scene,
+		[](obs_scene_t *, obs_sceneitem_t *item, void *param) {
+			obs_sceneitem_addref(item);
+			static_cast<std::vector<obs_sceneitem_t *> *>(param)->push_back(item);
+			return true;
+		},
+		&items);
+	return items;
+}
+
+void ReleaseItems(std::vector<obs_sceneitem_t *> &items)
+{
+	for (obs_sceneitem_t *item : items) {
+		obs_sceneitem_release(item);
+	}
+}
+
+bool CanDrawClean(obs_scene_t *scene)
+{
+	BoundsCropFn boundsCrop = GetBoundsCropFn();
+	std::vector<obs_sceneitem_t *> items = SceneItems(scene);
+	bool ok = true;
+	for (obs_sceneitem_t *item : items) {
+		if (!ok || !obs_sceneitem_visible(item)) {
+			continue;
+		}
+		obs_source_t *source = obs_sceneitem_get_source(item);
+		if (CleanFilterState(source) == 2) {
+			continue;
+		}
+		if (boundsCrop && obs_sceneitem_get_bounds_type(item) != OBS_BOUNDS_NONE && boundsCrop(item)) {
+			ok = false;
+		} else if (obs_scene_t *nested = obs_group_or_scene_from_source(source)) {
+			ok = CanDrawClean(nested);
+		}
+	}
+	ReleaseItems(items);
+	return ok;
+}
+
+void DrawSceneClean(MixData *mix, obs_scene_t *scene);
+
+void DrawContentClean(MixData *mix, obs_source_t *source)
+{
+	obs_scene_t *scene = obs_group_or_scene_from_source(source);
+	if (scene && CleanFilterState(source) == 0) {
+		DrawSceneClean(mix, scene);
+	} else {
+		obs_source_video_render(source);
+	}
+}
+
+const char *TechName(bool upscale, gs_color_space source, gs_color_space current)
+{
+	bool currentSdr = current == GS_CS_SRGB || current == GS_CS_SRGB_16F;
+	switch (source) {
+	case GS_CS_SRGB:
+	case GS_CS_SRGB_16F:
+		if (current == GS_CS_709_SCRGB)
+			return upscale ? "DrawUpscaleMultiply" : "DrawMultiply";
+		break;
+	case GS_CS_709_EXTENDED:
+		if (currentSdr)
+			return upscale ? "DrawUpscaleTonemap" : "DrawTonemap";
+		if (current == GS_CS_709_SCRGB)
+			return upscale ? "DrawUpscaleMultiply" : "DrawMultiply";
+		break;
+	case GS_CS_709_SCRGB:
+		if (currentSdr)
+			return upscale ? "DrawUpscaleMultiplyTonemap" : "DrawMultiplyTonemap";
+		if (current == GS_CS_709_EXTENDED)
+			return upscale ? "DrawUpscaleMultiply" : "DrawMultiply";
+		break;
+	}
+	return upscale ? "DrawUpscale" : "Draw";
+}
+
+/* Mirrors render_item_texture in obs-scene.c. */
+void DrawItemTexture(MixData *mix, obs_sceneitem_t *item, gs_texture_t *tex, const matrix4 &transform,
+		     gs_color_space current, gs_color_space source)
+{
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	obs_scale_type type = obs_sceneitem_get_scale_filter(item);
+	uint32_t cx = gs_texture_get_width(tex);
+	uint32_t cy = gs_texture_get_height(tex);
+	float scaleX = sqrtf(transform.x.x * transform.x.x + transform.x.y * transform.x.y);
+	float scaleY = sqrtf(transform.y.x * transform.y.x + transform.y.y * transform.y.y);
+
+	bool upscale = false;
+	if (type == OBS_SCALE_POINT) {
+		if (!mix->pointSampler) {
+			gs_sampler_info info = {};
+			info.filter = GS_FILTER_POINT;
+			info.address_u = GS_ADDRESS_CLAMP;
+			info.address_v = GS_ADDRESS_CLAMP;
+			info.address_w = GS_ADDRESS_CLAMP;
+			mix->pointSampler = gs_samplerstate_create(&info);
+		}
+		gs_effect_set_next_sampler(gs_effect_get_param_by_name(effect, "image"), mix->pointSampler);
+	} else if (type != OBS_SCALE_DISABLE && (fabsf(scaleX - 1.0f) > 1e-4f || fabsf(scaleY - 1.0f) > 1e-4f)) {
+		if (scaleX < 0.5f || scaleY < 0.5f) {
+			effect = obs_get_base_effect(OBS_EFFECT_BILINEAR_LOWRES);
+		} else if (type == OBS_SCALE_BICUBIC) {
+			effect = obs_get_base_effect(OBS_EFFECT_BICUBIC);
+		} else if (type == OBS_SCALE_LANCZOS) {
+			effect = obs_get_base_effect(OBS_EFFECT_LANCZOS);
+		} else if (type == OBS_SCALE_AREA) {
+			effect = obs_get_base_effect(OBS_EFFECT_AREA);
+			upscale = scaleX >= 1.0f && scaleY >= 1.0f;
+		}
+		if (gs_eparam_t *param = gs_effect_get_param_by_name(effect, "base_dimension")) {
+			vec2 base;
+			vec2_set(&base, (float)cx, (float)cy);
+			gs_effect_set_vec2(param, &base);
+		}
+		if (gs_eparam_t *param = gs_effect_get_param_by_name(effect, "base_dimension_i")) {
+			vec2 base;
+			vec2_set(&base, 1.0f / (float)cx, 1.0f / (float)cy);
+			gs_effect_set_vec2(param, &base);
+		}
+	}
+
+	bool sourceSdr = source != GS_CS_709_SCRGB;
+	bool currentSdr = current != GS_CS_709_SCRGB;
+	float multiplier = 1.0f;
+	if (!currentSdr && sourceSdr) {
+		multiplier = obs_get_video_sdr_white_level() / 80.0f;
+	} else if (currentSdr && !sourceSdr) {
+		multiplier = 80.0f / obs_get_video_sdr_white_level();
+	}
+	if (gs_eparam_t *param = gs_effect_get_param_by_name(effect, "multiplier")) {
+		gs_effect_set_float(param, multiplier);
+	}
+
+	size_t mode = (size_t)obs_sceneitem_get_blending_mode(item);
+	const BlendParams &blend = kBlendParams[mode < std::size(kBlendParams) ? mode : 0];
+	gs_blend_state_push();
+	gs_blend_function_separate(blend.srcColor, blend.dstColor, blend.srcAlpha, blend.dstAlpha);
+	gs_blend_op(blend.op);
+	while (gs_effect_loop(effect, TechName(upscale, source, current))) {
+		obs_source_draw(tex, 0, 0, 0, 0, false);
+	}
+	gs_blend_state_pop();
+}
+
+/* Mirrors render_item in obs-scene.c, without show/hide transitions. */
+void DrawItemClean(MixData *mix, obs_sceneitem_t *item)
+{
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!obs_sceneitem_visible(item) || CleanFilterState(source) == 2) {
+		return;
+	}
+
+	obs_sceneitem_crop crop;
+	obs_sceneitem_get_crop(item, &crop);
+	bool cropped = crop.left || crop.right || crop.top || crop.bottom;
+	obs_blending_method method = obs_sceneitem_get_blending_method(item);
+	bool useTexture = cropped || obs_sceneitem_get_scale_filter(item) != OBS_SCALE_DISABLE ||
+			  method == OBS_BLEND_METHOD_SRGB_OFF ||
+			  obs_sceneitem_get_blending_mode(item) != OBS_BLEND_NORMAL ||
+			  (obs_scene_from_source(source) != nullptr);
+
+	matrix4 transform;
+	obs_sceneitem_get_draw_transform(item, &transform);
+
+	if (!useTexture) {
+		bool previous = gs_set_linear_srgb(true);
+		gs_matrix_push();
+		gs_matrix_mul(&transform);
+		DrawContentClean(mix, source);
+		gs_matrix_pop();
+		gs_set_linear_srgb(previous);
+		return;
+	}
+
+	uint32_t width = obs_source_get_width(source);
+	uint32_t height = obs_source_get_height(source);
+	if (!width || !height) {
+		return;
+	}
+	uint32_t cropX = (uint32_t)(crop.left + crop.right);
+	uint32_t cropY = (uint32_t)(crop.top + crop.bottom);
+	uint32_t cx = cropX > width ? 2 : width - cropX;
+	uint32_t cy = cropY > height ? 2 : height - cropY;
+
+	gs_color_space current = gs_get_color_space();
+	gs_color_space space = obs_source_get_color_space(source, 1, &current);
+	gs_color_format format = gs_get_format_from_space(space);
+
+	gs_texrender_t *&texrender = mix->textures[item];
+	if (texrender && gs_texrender_get_format(texrender) != format) {
+		gs_texrender_destroy(texrender);
+		texrender = nullptr;
+	}
+	if (!texrender) {
+		texrender = gs_texrender_create(format, GS_ZS_NONE);
+	}
+	mix->used.insert(item);
+
+	gs_texrender_reset(texrender);
+	if (!gs_texrender_begin_with_color_space(texrender, cx, cy, space)) {
+		return;
+	}
+	vec4 clear;
+	vec4_zero(&clear);
+	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+	gs_matrix_scale3f((float)width / (float)cx, (float)height / (float)cy, 1.0f);
+	gs_matrix_translate3f(-(float)crop.left, -(float)crop.top, 0.0f);
+	DrawContentClean(mix, source);
+	gs_texrender_end(texrender);
+
+	gs_texture_t *tex = gs_texrender_get_texture(texrender);
+	if (!tex) {
+		return;
+	}
+	bool previous = gs_set_linear_srgb(method != OBS_BLEND_METHOD_SRGB_OFF);
+	gs_matrix_push();
+	gs_matrix_mul(&transform);
+	DrawItemTexture(mix, item, tex, transform, current, space);
+	gs_matrix_pop();
+	gs_set_linear_srgb(previous);
+}
+
+void DrawSceneClean(MixData *mix, obs_scene_t *scene)
+{
+	std::vector<obs_sceneitem_t *> items = SceneItems(scene);
+	gs_blend_state_push();
+	gs_reset_blend_state();
+	for (obs_sceneitem_t *item : items) {
+		DrawItemClean(mix, item);
+	}
+	gs_blend_state_pop();
+	ReleaseItems(items);
+}
+
+/* The scene on air when no transition is running, or null. */
+obs_source_t *SteadyProgramScene(obs_source_t *program)
+{
+	if (obs_source_get_type(program) != OBS_SOURCE_TYPE_TRANSITION) {
+		return obs_scene_from_source(program) ? obs_source_get_ref(program) : nullptr;
+	}
+	obs_source_t *next = obs_transition_get_source(program, OBS_TRANSITION_SOURCE_B);
+	if (next) {
+		obs_source_release(next);
+		return nullptr;
+	}
+	obs_source_t *scene = obs_transition_get_source(program, OBS_TRANSITION_SOURCE_A);
+	if (scene && !obs_scene_from_source(scene)) {
+		obs_source_release(scene);
+		return nullptr;
+	}
+	return scene;
+}
+
+void *MixCreate(obs_data_t *, obs_source_t *source)
+{
+	auto *mix = new MixData;
+	mix->source = source;
+	return mix;
+}
+
+void MixDestroy(void *data)
+{
+	auto *mix = static_cast<MixData *>(data);
+	obs_enter_graphics();
+	for (auto &entry : mix->textures) {
+		gs_texrender_destroy(entry.second);
+	}
+	if (mix->pointSampler) {
+		gs_samplerstate_destroy(mix->pointSampler);
+	}
+	obs_leave_graphics();
+	delete mix;
+}
 
 uint32_t MixGetWidth(void *)
 {
@@ -114,17 +470,35 @@ uint32_t MixGetHeight(void *)
 	return obs_get_video_info(&ovi) ? ovi.base_height : 0;
 }
 
-void MixRender(void *, gs_effect_t *)
+void MixRender(void *data, gs_effect_t *)
 {
+	auto *mix = static_cast<MixData *>(data);
 	obs_source_t *program = obs_get_output_source(0);
 	if (!program) {
 		return;
 	}
+	obs_source_t *scene = SteadyProgramScene(program);
 
 	g_cleanPass++;
-	obs_source_video_render(program);
+	if (scene && CleanFilterState(scene) == 2) {
+		/* The whole program scene is left out. */
+	} else if (scene && CleanFilterState(scene) == 0 && CanDrawClean(obs_scene_from_source(scene))) {
+		mix->used.clear();
+		DrawSceneClean(mix, obs_scene_from_source(scene));
+		for (auto it = mix->textures.begin(); it != mix->textures.end();) {
+			if (mix->used.count(it->first)) {
+				++it;
+			} else {
+				gs_texrender_destroy(it->second);
+				it = mix->textures.erase(it);
+			}
+		}
+	} else {
+		obs_source_video_render(program);
+	}
 	g_cleanPass--;
 
+	obs_source_release(scene);
 	obs_source_release(program);
 }
 
@@ -234,19 +608,22 @@ void SetHidden(obs_source_t *source, bool hidden)
 
 struct SourceRow {
 	std::string name;
+	bool scene;
 	bool gazcast;
 	bool overlay;
 	bool hidden;
 
 	bool operator==(const SourceRow &other) const
 	{
-		return name == other.name && gazcast == other.gazcast && overlay == other.overlay &&
-		       hidden == other.hidden;
+		return name == other.name && scene == other.scene && gazcast == other.gazcast &&
+		       overlay == other.overlay && hidden == other.hidden;
 	}
 };
 
-/* Every input with video, overlays first. Nothing is ticked or hidden
- * automatically; the user chooses. */
+/* Every scene, then every input with video (overlays first). Unticking a scene
+ * leaves out everything in it: the filter skips the whole scene, whether it is
+ * nested in another scene or is the program scene itself. Nothing is ticked or
+ * hidden automatically; the user chooses. */
 std::vector<SourceRow> ScanSources()
 {
 	/* Collect first, then read each source outside obs_enum_sources. */
@@ -259,17 +636,31 @@ std::vector<SourceRow> ScanSources()
 			return true;
 		},
 		&sources);
+	std::vector<OBSSource> scenes;
+	obs_enum_scenes(
+		[](void *param, obs_source_t *source) {
+			static_cast<std::vector<OBSSource> *>(param)->emplace_back(source);
+			return true;
+		},
+		&scenes);
 
 	std::vector<SourceRow> rows;
+	for (obs_source_t *scene : scenes) {
+		const char *name = obs_source_get_name(scene);
+		rows.push_back({name ? name : "", true, false, false, HasHideFilter(scene)});
+	}
 	for (obs_source_t *source : sources) {
 		const bool gazcast = IsGazCastOverlay(source);
 		const bool overlay = gazcast || IsOverlay(source);
 
 		const char *name = obs_source_get_name(source);
-		rows.push_back({name ? name : "", gazcast, overlay, HasHideFilter(source)});
+		rows.push_back({name ? name : "", false, gazcast, overlay, HasHideFilter(source)});
 	}
 
 	std::stable_sort(rows.begin(), rows.end(), [](const SourceRow &a, const SourceRow &b) {
+		if (a.scene != b.scene) {
+			return a.scene;
+		}
 		if (a.overlay != b.overlay) {
 			return a.overlay;
 		}
@@ -644,7 +1035,9 @@ void RefreshList()
 	g_ui.list->clear();
 	for (const SourceRow &row : rows) {
 		QString label = QString::fromStdString(row.name);
-		if (row.overlay) {
+		if (row.scene) {
+			label += QStringLiteral("  ") + QString::fromUtf8(obs_module_text("GazCast.Clean.SceneTag"));
+		} else if (row.overlay) {
 			label += QStringLiteral("  ") +
 				 QString::fromUtf8(obs_module_text(row.gazcast ? "GazCast.Clean.GazCastTag"
 									       : "GazCast.Clean.OverlayTag"));

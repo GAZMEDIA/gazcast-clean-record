@@ -28,9 +28,10 @@ Studio), or delete `C:\ProgramData\obs-studio\plugins\gazcast-clean-record`.
 
 ## Use
 
-1. The **GazCast Clean Record** dock lists every source in OBS, all ticked.
-   Untick the ones to leave out of the clean recording (your overlays,
-   logos, text...). Sources that look like overlays (browser sources,
+1. The **GazCast Clean Record** dock lists every scene and source in OBS, all
+   ticked. Untick the ones to leave out of the clean recording (your overlays,
+   logos, text...). Untick a scene to leave out everything in it, for example
+   a "Graphics" scene you place inside your other scenes. Sources that look like overlays (browser sources,
    GazCast and other web overlays, images, slideshows, text) are labelled
    "(overlay)" to help you choose, but nothing is unticked for you.
 2. Press **Start Recording** in OBS as usual. With **Start and stop together
@@ -40,7 +41,8 @@ Studio), or delete `C:\ProgramData\obs-studio\plugins\gazcast-clean-record`.
 3. You can also use the dock's own **Start clean recording** button; that file
    is called `GazCast clean <date> <time>` and goes in your recording folder.
 
-Ticking a source adds a filter called **Hide in GazCast clean recording** to
+Unticking a scene or source adds a filter called **Hide in GazCast clean
+recording** to
 it, so you can also add or remove it from the source's **Filters** window. It
 is saved with your scene collection.
 
@@ -51,18 +53,19 @@ survive a crash.
 
 ## Known limits
 
-OBS draws a few things once per frame and reuses them. An overlay still shows
-in the clean copy if it sits inside a scene item that is cropped, has a scale
-filter or a blending mode set, and during the second or so a scene transition
-runs. The stream is never affected.
+Overlays can show in the clean copy for the second or so a scene transition
+runs, and in scenes that contain an item using **Crop to bounds**. The stream
+is never affected.
 
 ## How it works
 
 - The **Hide in GazCast clean recording** filter (`gazcast_clean_hide`) passes
   its source through untouched, except while the clean mix is rendering, when
   it draws nothing.
-- While a clean recording runs, a private source renders OBS's program output
-  (output channel 0) into its own video mix (`obs_view`). That mix gets its own
+- While a clean recording runs, a private source draws OBS's program scene
+  into its own video mix (`obs_view`). It walks the scene's items and nested
+  scenes itself, with its own textures for cropped, scaled or blended items,
+  so nothing drawn for the stream is reused. That mix gets its own
   encoders and an `ffmpeg_muxer` output, with the normal recording's first
   audio track.
 - Settings live in
